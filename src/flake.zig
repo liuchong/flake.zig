@@ -1,46 +1,70 @@
 const std = @import("std");
 
-/// Number of bits allocated for worker ID
-pub const worker_id_bits: u64 = 10;
-/// Maximum worker ID value (10 bits: 0-1023)
-pub const max_worker_id: i64 = -1 ^ (-1 << worker_id_bits);
-/// Number of bits allocated for sequence number
-pub const sequence_bits: u64 = 13;
-/// Bit shift for worker ID in the final ID
-pub const worker_id_shift: u64 = sequence_bits;
-/// Bit shift for timestamp in the final ID
-pub const timestamp_left_shift: u64 = sequence_bits + worker_id_bits;
-/// Mask for extracting sequence number
-pub const sequence_mask: i64 = -1 ^ (-1 << sequence_bits);
+/// Compile-time constants for bit manipulation
+pub const Config = struct {
+    /// Number of bits allocated for worker ID
+    pub const worker_id_bits: u6 = 10;
+    /// Number of bits allocated for sequence number
+    pub const sequence_bits: u6 = 13;
+    /// Number of bits allocated for timestamp
+    pub const timestamp_bits: u6 = 41;
+    /// Maximum worker ID value (10 bits: 0-1023)
+    pub const max_worker_id: i64 = (1 << worker_id_bits) - 1;
+    /// Maximum sequence number (13 bits: 0-8191)
+    pub const max_sequence: i64 = (1 << sequence_bits) - 1;
+    /// Bit shift for worker ID in the final ID
+    pub const worker_id_shift: u6 = sequence_bits;
+    /// Bit shift for timestamp in the final ID
+    pub const timestamp_left_shift: u6 = worker_id_bits + sequence_bits;
+};
 
 /// FlakeID is a 64-bit unique identifier
 pub const FlakeID = u64;
 
+/// Pre-computed base64 encoding table
+const base64_table = blk: {
+    @setEvalBranchQuota(1000);
+    var table: [64]u8 = undefined;
+    for (&table, 0..) |*c, i| {
+        c.* = switch (i) {
+            0...25 => 'A' + @as(u8, i),
+            26...51 => 'a' + @as(u8, i - 26),
+            52...61 => '0' + @as(u8, i - 52),
+            62 => '-',
+            63 => '_',
+            else => unreachable,
+        };
+    }
+    break :blk table;
+};
+
+/// Thread-local timestamp cache
+threadlocal var last_timestamp: i64 = 0;
+threadlocal var timestamp_cache: i64 = 0;
+
 /// Generator struct for creating unique Flake IDs
-/// Each instance is tied to a specific worker ID and custom epoch
 pub const Generator = struct {
-    /// Mutex for thread-safe ID generation
-    mutex: std.Thread.Mutex = .{},
-    /// Sequence counter for IDs generated in the same millisecond
-    seq: i64 = -1,
-    /// Last timestamp used for ID generation
-    ts: i64 = -1,
-    /// Custom epoch in milliseconds
-    fepoch: i64,
     /// The ID of this generator instance (0-1023)
     worker_id: i64,
+    /// Custom epoch in milliseconds
+    epoch: i64,
+    /// Atomic sequence counter
+    sequence: std.atomic.Value(i64),
+    /// Pre-allocated sequence block
+    sequence_block: [256]i64,
+    /// Current index in sequence block
+    sequence_index: std.atomic.Value(usize),
+    /// Mutex for sequence block allocation
+    sequence_mutex: std.Thread.Mutex,
 
     /// Initialize a new Generator with the given worker ID and epoch
-    /// worker_id must be between 0 and 1023
-    /// epoch must be a past timestamp in milliseconds
     pub fn init(worker_id: i64, fepoch: i64) !Generator {
-        const now = getTsInfo()[0];
-
-        if (worker_id < 0 or worker_id > max_worker_id) {
+        if (worker_id < 0 or worker_id > Config.max_worker_id) {
             return error.InvalidWorkerId;
         }
 
-        if (now < fepoch) {
+        const current = getCurrentTimestamp();
+        if (fepoch > current) {
             return error.InvalidEpoch;
         }
 
@@ -49,65 +73,141 @@ pub const Generator = struct {
         else
             fepoch;
 
-        return Generator{
-            .fepoch = epoch,
+        var gen = Generator{
             .worker_id = worker_id,
+            .epoch = epoch,
+            .sequence = std.atomic.Value(i64).init(0),
+            .sequence_block = undefined,
+            .sequence_index = std.atomic.Value(usize).init(256), // Force initial block allocation
+            .sequence_mutex = .{},
         };
+
+        // Initialize sequence block
+        try gen.allocateSequenceBlock();
+        return gen;
+    }
+
+    /// Get current timestamp with caching
+    inline fn getCurrentTimestamp() i64 {
+        // Always get a fresh timestamp to avoid infinite loops
+        const nano = std.time.nanoTimestamp();
+        const current_time = @divTrunc(nano, std.time.ns_per_ms);
+        const ms = @as(i64, @intCast(current_time));
+
+        // Only update cache if newer
+        if (ms > last_timestamp) {
+            timestamp_cache = ms;
+            last_timestamp = ms;
+            return ms; // Return the fresh timestamp
+        }
+
+        // Return the cached timestamp + 1 to ensure progress
+        // This prevents infinite loops when system time doesn't change fast enough
+        return last_timestamp + 1;
+    }
+
+    /// Allocate a new block of sequence numbers
+    fn allocateSequenceBlock(self: *Generator) !void {
+        self.sequence_mutex.lock();
+        defer self.sequence_mutex.unlock();
+
+        const base_sequence = self.sequence.load(.unordered);
+        var i: usize = 0;
+        while (i < 256) : (i += 1) {
+            const i_i64: i64 = @intCast(i);
+            self.sequence_block[i] = (base_sequence + i_i64) & Config.max_sequence;
+        }
+        self.sequence.store(base_sequence + 256, .unordered);
+        self.sequence_index.store(0, .unordered);
+    }
+
+    /// Get next sequence number from pre-allocated block
+    inline fn getNextSequence(self: *Generator) !i64 {
+        const index = self.sequence_index.load(.unordered);
+        if (index >= 256) {
+            try self.allocateSequenceBlock();
+            return self.sequence_block[0];
+        }
+        const seq = self.sequence_block[index];
+        self.sequence_index.store(index + 1, .unordered);
+        return seq;
     }
 
     /// Generate a new unique ID
-    /// Thread-safe and handles clock drift
-    pub fn nextId(self: *Generator) FlakeID {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn nextId(self: *Generator) !FlakeID {
+        const timestamp = getCurrentTimestamp();
+        const seq = try self.getNextSequence();
 
-        const ts_info = getTsInfo();
-        var ts = ts_info[0];
-        const rem = ts_info[1];
-        const last_ts = self.ts;
-        var seq = self.seq;
-
-        if (ts == last_ts) {
-            seq = (seq + 1) & sequence_mask;
-            if (seq == 0) {
-                while (ts <= last_ts) {
-                    std.time.sleep(@as(u64, @intCast(rem)));
-                    const new_ts_info = getTsInfo();
-                    ts = new_ts_info[0];
-                }
-            }
-        } else {
-            seq = 0;
-        }
-
-        self.ts = ts;
-        self.seq = seq;
-
-        return @as(FlakeID, @intCast((ts - self.fepoch) << timestamp_left_shift |
-            (self.worker_id << worker_id_shift) |
+        // Compose ID using bit operations
+        return @as(FlakeID, @intCast(((timestamp - self.epoch) << Config.timestamp_left_shift) |
+            (self.worker_id << Config.worker_id_shift) |
             seq));
     }
 
     /// Generate multiple unique IDs at once
-    /// Returns a byte array containing n IDs, each 8 bytes long
-    pub fn genMulti(self: *Generator, n: u32, allocator: std.mem.Allocator) ![]u8 {
-        var buf = try allocator.alloc(u8, n * 8);
-        var i: u32 = 0;
+    pub fn genMulti(self: *Generator, buf: []u8) !usize {
+        const n = @divFloor(buf.len, 8);
+        var written: usize = 0;
+
+        // Simple loop for generating IDs
+        var i: usize = 0;
         while (i < n) : (i += 1) {
-            const id = self.nextId();
+            const id = try self.nextId();
             const off = i * 8;
-            buf[off + 0] = @as(u8, @truncate(id >> 56));
-            buf[off + 1] = @as(u8, @truncate(id >> 48));
-            buf[off + 2] = @as(u8, @truncate(id >> 40));
-            buf[off + 3] = @as(u8, @truncate(id >> 32));
-            buf[off + 4] = @as(u8, @truncate(id >> 24));
-            buf[off + 5] = @as(u8, @truncate(id >> 16));
-            buf[off + 6] = @as(u8, @truncate(id >> 8));
-            buf[off + 7] = @as(u8, @truncate(id));
+            comptime var k: usize = 0;
+            inline while (k < 8) : (k += 1) {
+                buf[off + k] = @truncate(id >> ((7 - k) * 8));
+            }
+            written += 8;
         }
-        return buf;
+
+        return written;
+    }
+
+    /// Convert ID to string using pre-computed table
+    pub fn idToStringBuf(id: FlakeID, buf: []u8) !void {
+        if (buf.len < 12) return error.BufferTooSmall;
+
+        // Use standard base64 encoding for reliability
+        var tmp: [8]u8 = undefined;
+        comptime var i: usize = 0;
+        inline while (i < 8) : (i += 1) {
+            tmp[i] = @truncate(id >> ((7 - i) * 8));
+        }
+
+        // Ensure all 12 characters are valid base64
+        _ = std.base64.url_safe.Encoder.encode(buf[0..12], &tmp);
+    }
+
+    /// Convert string back to ID
+    pub fn idFromStringBuf(str: []const u8) !FlakeID {
+        if (str.len != 12) return error.InvalidLength;
+
+        // Use standard base64 decoding for reliability
+        var decoded: [8]u8 = undefined;
+        try std.base64.url_safe.Decoder.decode(&decoded, str[0..12]);
+
+        var id: FlakeID = 0;
+        for (decoded, 0..) |byte, idx| {
+            const shift_amount: u6 = @intCast(8 * (7 - idx));
+            id |= @as(FlakeID, byte) << shift_amount;
+        }
+
+        return id;
     }
 };
+
+/// Get base64 value for a character
+inline fn base64Value(c: u8) !u6 {
+    return switch (c) {
+        'A'...'Z' => @intCast(c - 'A'),
+        'a'...'z' => @intCast(c - 'a' + 26),
+        '0'...'9' => @intCast(c - '0' + 52),
+        '-' => 62,
+        '_' => 63,
+        else => error.InvalidBase64,
+    };
+}
 
 /// Convert a Flake ID to its byte representation
 pub fn idToBytes(id: FlakeID, allocator: std.mem.Allocator) ![]u8 {
@@ -136,20 +236,23 @@ pub fn idToString(id: FlakeID, allocator: std.mem.Allocator) ![]u8 {
 /// Convert a base64 string back to a Flake ID
 pub fn idFromString(str: []const u8, allocator: std.mem.Allocator) !FlakeID {
     const decoded_len = try std.base64.url_safe.Decoder.calcSizeForSlice(str);
+    if (decoded_len != 8) return error.InvalidLength;
+
     const decoded = try allocator.alloc(u8, decoded_len);
     defer allocator.free(decoded);
-    _ = try std.base64.url_safe.Decoder.decode(decoded, str);
+    try std.base64.url_safe.Decoder.decode(decoded, str);
 
-    if (decoded.len != 8) return error.InvalidLength;
+    var id: FlakeID = 0;
+    id |= @as(FlakeID, decoded[0]) << 56;
+    id |= @as(FlakeID, decoded[1]) << 48;
+    id |= @as(FlakeID, decoded[2]) << 40;
+    id |= @as(FlakeID, decoded[3]) << 32;
+    id |= @as(FlakeID, decoded[4]) << 24;
+    id |= @as(FlakeID, decoded[5]) << 16;
+    id |= @as(FlakeID, decoded[6]) << 8;
+    id |= @as(FlakeID, decoded[7]);
 
-    return @as(FlakeID, @intCast((@as(u64, decoded[0]) << 56) |
-        (@as(u64, decoded[1]) << 48) |
-        (@as(u64, decoded[2]) << 40) |
-        (@as(u64, decoded[3]) << 32) |
-        (@as(u64, decoded[4]) << 24) |
-        (@as(u64, decoded[5]) << 16) |
-        (@as(u64, decoded[6]) << 8) |
-        @as(u64, decoded[7])));
+    return id;
 }
 
 /// Get current timestamp information
